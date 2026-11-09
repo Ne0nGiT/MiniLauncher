@@ -81,15 +81,15 @@ class AppAdapter(val ctx: Context, var items: List<AppItem>) : BaseAdapter() {
 
 class MainActivity : Activity() {
     var apps = listOf<AppItem>()
-    lateinit var overlay: View
+    lateinit var drawer: View
     lateinit var search: EditText
     lateinit var favAd: AppAdapter
     lateinit var allAd: AppAdapter
     lateinit var empty: TextView
 
     override fun onResume() { super.onResume(); setContentView(build()); load() }
-    override fun onNewIntent(intent: Intent?) { super.onNewIntent(intent); if (::overlay.isInitialized) closeDrawer() }
-    override fun onBackPressed() { if (::overlay.isInitialized && overlay.visibility == View.VISIBLE) closeDrawer() }
+    override fun onNewIntent(intent: Intent?) { super.onNewIntent(intent); if (::drawer.isInitialized) closeDrawer() }
+    override fun onBackPressed() { if (::drawer.isInitialized && drawer.visibility == View.VISIBLE) closeDrawer() }
 
     fun favs() = prefs().getString("favs", "")!!.split(",").filter { it.isNotEmpty() }
     fun favApps() = favs().mapNotNull { p -> apps.find { it.pkg == p } }
@@ -138,7 +138,7 @@ class MainActivity : Activity() {
     fun mlp() = LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dp(4), 0, dp(4), 0) }
 
     fun openDrawer(focus: Boolean) {
-        overlay.visibility = View.VISIBLE
+        drawer.visibility = View.VISIBLE
         search.setText("")
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         if (focus) search.post { search.requestFocus(); imm.showSoftInput(search, 0) }
@@ -147,7 +147,7 @@ class MainActivity : Activity() {
 
     fun closeDrawer() {
         (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(search.windowToken, 0)
-        overlay.visibility = View.GONE
+        drawer.visibility = View.GONE
     }
 
     fun build(): View {
@@ -193,12 +193,12 @@ class MainActivity : Activity() {
             })
             setOnEditorActionListener { _, _, _ -> allAd.items.firstOrNull()?.let { launch(it) }; true }
         }
-        overlay = LinearLayout(this).apply {
+        drawer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(bg); isClickable = true
             setPadding(dp(16), dp(20), dp(16), dp(16)); visibility = View.GONE
             addView(search, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
             addView(grid(cols, allAd), LinearLayout.LayoutParams(-1, 0, 1f))
         }
-        return FrameLayout(this).apply { setBackgroundColor(bg); addView(home); addView(overlay) }
+        return FrameLayout(this).apply { setBackgroundColor(bg); addView(home); addView(drawer) }
     }
 }
