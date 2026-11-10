@@ -1,4 +1,5 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.SET_WALLPAPER" />
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
