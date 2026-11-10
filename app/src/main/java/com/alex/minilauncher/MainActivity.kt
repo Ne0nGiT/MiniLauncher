@@ -3,8 +3,12 @@ package com.alex.minilauncher
 import android.app.Activity
 import android.app.ActivityOptions
 import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.LauncherApps
+import android.content.pm.ShortcutInfo
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -14,6 +18,8 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
+import android.os.Process
+import android.provider.AlarmClock
 import android.provider.Settings
 import android.text.Editable
 import android.text.TextUtils
@@ -42,12 +48,60 @@ fun letterOf(s: String): Char {
     return if (c != null && c in 'A'..'Z') c else '#'
 }
 
-/** Nền = hình nền hệ thống + lớp phủ đen/trắng. Trả về màu chữ. */
-fun Activity.setupWindow(): Int {
-    val p = prefs(); val light = p.getBoolean("light", false)
-    val base = if (light) 255 else 0
-    val a = p.getInt("dim", 65) * 255 / 100
-    window.setBackgroundDrawable(ColorDrawable(Color.argb(a, base, base, base)))
+class Calc(val s: String) {
+    var i = 0
+    fun eval(): Double? = try { val v = expr(); if (i == s.length) v else null } catch (e: Exception) { null }
+    private fun peek(): Char = if (i < s.length) s[i] else '\u0000'
+    private fun expr(): Double {
+        var v = term()
+        while (peek() == '+' || peek() == '-') { val o = s[i++]; val r = term(); v = if (o == '+') v + r else v - r }
+        return v
+    }
+    private fun term(): Double {
+        var v = pow()
+        while (peek() == '*' || peek() == '/' || peek() == '%') {
+            val o = s[i++]; val r = pow()
+            v = when (o) { '*' -> v * r; '/' -> v / r; else -> v % r }
+        }
+        return v
+    }
+    private fun pow(): Double { val b = unary(); return if (peek() == '^') { i++; Math.pow(b, pow()) } else b }
+    private fun unary(): Double = when (peek()) { '-' -> { i++; -unary() }; '+' -> { i++; unary() }; else -> atom() }
+    private fun atom(): Double {
+        if (peek() == '(') { i++; val v = expr(); if (peek() != ')') throw Exception(); i++; return v }
+        val st = i
+        while (peek().isDigit() || peek() == '.') i++
+        if (st == i) throw Exception()
+        return s.substring(st, i).toDouble()
+    }
+}
+
+fun calc(q: String): String? {
+    val s = q.replace(" ", "").replace(',', '.').replace('x', '*').replace('×', '*').replace(':', '/')
+    if (s.length < 3 || s.none { it in "+-*/^%" } || s.none { it.isDigit() }) return null
+    val v = Calc(s).eval() ?: return null
+    if (v.isNaN() || v.isInfinite()) return null
+    return if (v == Math.floor(v) && Math.abs(v) < 1e15) v.toLong().toString()
+    else String.format(java.util.Locale.US, "%.8f", v).trimEnd('0').trimEnd('.')
+}
+
+/** Nền theo cài đặt (plain = màn Cài đặt: nền riêng, không lộ hình nền hệ thống). Trả về màu chữ. */
+fun Activity.setupWindow(plain: Boolean = false): Int {
+    val p = prefs()
+    val lightPref = p.getBoolean("light", false)
+    val wall = p.getString("wall", null) ?: if (p.getBoolean("black", false)) "black" else "system"
+    val light: Boolean
+    if (plain) {
+        light = lightPref
+        window.setBackgroundDrawable(if (lightPref) ColorDrawable(0xFFF2F2F2.toInt()) else Wall.window(this, "black", 100))
+    } else if (wall == "system") {
+        light = lightPref
+        val base = if (light) 255 else 0
+        window.setBackgroundDrawable(ColorDrawable(Color.argb(p.getInt("dim", 65) * 255 / 100, base, base, base)))
+    } else {
+        light = Wall.isLight(wall)
+        window.setBackgroundDrawable(Wall.window(this, wall, p.getInt("dim", 65)))
+    }
     window.statusBarColor = Color.TRANSPARENT
     window.navigationBarColor = Color.TRANSPARENT
     var f = 0
@@ -120,6 +174,7 @@ class MainActivity : Activity() {
     lateinit var allBox: LinearLayout
     lateinit var index: LinearLayout
     lateinit var bubble: TextView
+    lateinit var clockBox: LinearLayout
 
     override fun onResume() { super.onResume(); setContentView(build()); load() }
     override fun onNewIntent(intent: Intent?) { super.onNewIntent(intent); reset() }
@@ -134,9 +189,11 @@ class MainActivity : Activity() {
 
     fun anim() = prefs().getBoolean("anim", true)
     fun favs() = prefs().getString("favs", "")!!.split(",").filter { it.isNotEmpty() }
-    fun favApps() = favs().mapNotNull { p -> apps.find { it.pkg == p } }
+    fun hidden() = prefs().getString("hidden", "")!!.split(",").filter { it.isNotEmpty() }
+    fun favApps(): List<AppItem> { val h = hidden(); return favs().mapNotNull { p -> apps.find { it.pkg == p && it.pkg !in h } } }
+    fun setList(k: String, l: List<String>) { prefs().edit().putString(k, l.joinToString(",")).apply(); refresh(false) }
     fun query() = norm(search.text.toString().trim())
-    fun results(): List<AppItem> { val q = query(); return if (q.isEmpty()) apps else apps.filter { norm(it.label).contains(q) } }
+    fun results(): List<AppItem> { val q = query(); return if (q.isEmpty()) { val h = hidden(); apps.filter { it.pkg !in h } } else apps.filter { norm(it.label).contains(q) } }
 
     fun load() = Thread {
         val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
@@ -154,19 +211,53 @@ class MainActivity : Activity() {
         else startActivity(i)
     }
 
+    fun shortcutsOf(pkg: String): List<ShortcutInfo> {
+        if (Build.VERSION.SDK_INT < 25) return emptyList()
+        return try {
+            val la = getSystemService(Context.LAUNCHER_APPS_SERVICE) as LauncherApps
+            if (!la.hasShortcutHostPermission()) return emptyList()
+            val q = LauncherApps.ShortcutQuery().setPackage(pkg)
+                .setQueryFlags(LauncherApps.ShortcutQuery.FLAG_MATCH_DYNAMIC or LauncherApps.ShortcutQuery.FLAG_MATCH_MANIFEST)
+            (la.getShortcuts(q, Process.myUserHandle()) ?: emptyList()).filter { it.isEnabled }.take(4)
+        } catch (e: Exception) { emptyList() }
+    }
+
+    fun webSearch(q: String) {
+        if (q.isEmpty()) return
+        try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(q)))) } catch (e: Exception) {}
+    }
+
+    fun copy(t: String) {
+        (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("kq", t))
+        Toast.makeText(this, "Đã sao chép", Toast.LENGTH_SHORT).show()
+    }
+
+    fun row(t: String, onClick: () -> Unit) = TextView(this).apply {
+        text = t; setTextColor(fg); textSize = 16f; setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply { cornerRadius = dp(20).toFloat(); setColor(Color.argb(0x26, Color.red(fg), Color.green(fg), Color.blue(fg))) }
+        layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) }
+        setOnClickListener { onClick() }; pressAnim()
+    }
+
     fun menu(a: AppItem) {
-        val isFav = favs().contains(a.pkg)
-        AlertDialog.Builder(this).setTitle(a.label).setItems(
-            arrayOf(if (isFav) "Bỏ khỏi Yêu thích" else "Thêm vào Yêu thích", "Thông tin ứng dụng", "Gỡ cài đặt")
-        ) { _, w ->
-            when (w) {
-                0 -> {
-                    val f = favs().toMutableList()
-                    if (!f.remove(a.pkg)) f.add(a.pkg)
-                    prefs().edit().putString("favs", f.joinToString(",")).apply(); refresh(false)
+        val sc = shortcutsOf(a.pkg)
+        val isFav = favs().contains(a.pkg); val isHid = hidden().contains(a.pkg)
+        val names = sc.map { "↗ " + (it.shortLabel ?: it.id) } + listOf(
+            if (isFav) "Bỏ khỏi Yêu thích" else "Thêm vào Yêu thích",
+            if (isHid) "Bỏ ẩn" else "Ẩn ứng dụng", "Thông tin ứng dụng", "Gỡ cài đặt")
+        AlertDialog.Builder(this).setTitle(a.label).setItems(names.toTypedArray()) { _, w ->
+            if (w < sc.size) {
+                try { (getSystemService(Context.LAUNCHER_APPS_SERVICE) as LauncherApps).startShortcut(sc[w], null, null) } catch (e: Exception) {}
+            } else when (w - sc.size) {
+                0 -> { val f = favs().toMutableList(); if (!f.remove(a.pkg)) f.add(a.pkg); setList("favs", f) }
+                1 -> {
+                    val h = hidden().toMutableList()
+                    if (!h.remove(a.pkg)) { h.add(a.pkg); prefs().edit().putString("favs", favs().filter { it != a.pkg }.joinToString(",")).apply() }
+                    setList("hidden", h)
                 }
-                1 -> startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${a.pkg}")))
-                2 -> startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${a.pkg}")))
+                2 -> startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${a.pkg}")))
+                3 -> startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${a.pkg}")))
+                else -> {}
             }
         }.show()
     }
@@ -244,6 +335,7 @@ class MainActivity : Activity() {
         val cols = prefs().getInt("cols", 4)
         val vis = if (searching) View.GONE else View.VISIBLE
         favTitle.visibility = vis; favBox.visibility = vis; allTitle.visibility = vis; index.visibility = vis
+        clockBox.visibility = if (searching || !prefs().getBoolean("clock", true)) View.GONE else View.VISIBLE
         var base = 0
         if (!searching) {
             val f = favApps(); base = minOf(f.size, 8)
@@ -256,6 +348,11 @@ class MainActivity : Activity() {
             } else fill(favBox, f, cols, anim, false, 0)
         }
         fill(allBox, results(), cols, anim && !searching, !searching, base)
+        if (searching) {
+            val q = search.text.toString().trim()
+            allBox.addView(row("Tìm “$q” trên Google") { webSearch(q) }, 0)
+            calc(q)?.let { r -> allBox.addView(row("= $r") { copy(r) }, 0) }
+        }
         if (!searching) for (i in letters.indices) index.getChildAt(i).alpha = if (letterRow.containsKey(letters[i])) 1f else .3f
         runPending()
     }
@@ -269,9 +366,21 @@ class MainActivity : Activity() {
         favTitle = sec("Yêu thích"); allTitle = sec("Tất cả ứng dụng")
         favBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         allBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        clockBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(20), 0, dp(4))
+            addView(TextClock(context).apply {
+                format24Hour = "HH:mm"; format12Hour = "HH:mm"; setTextColor(fg); textSize = 54f
+                typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+            })
+            addView(TextClock(context).apply {
+                format24Hour = "EEEE, d MMMM"; format12Hour = "EEEE, d MMMM"; setTextColor(fg); alpha = .7f; textSize = 15f
+            })
+            setOnClickListener { try { startActivity(Intent(AlarmClock.ACTION_SHOW_ALARMS)) } catch (e: Exception) {} }
+            pressAnim()
+        }
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setPadding(dp(14), 0, dp(26), dp(24))
-            addView(favTitle); addView(favBox); addView(allTitle); addView(allBox)
+            addView(clockBox); addView(favTitle); addView(favBox); addView(allTitle); addView(allBox)
         }
         scroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false; addView(content) }
 
@@ -284,7 +393,11 @@ class MainActivity : Activity() {
                 override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
                 override fun afterTextChanged(s: Editable?) { refresh(false); scroll.scrollTo(0, 0) }
             })
-            setOnEditorActionListener { _, _, _ -> results().firstOrNull()?.let { launch(it, this) }; true }
+            setOnEditorActionListener { _, _, _ ->
+                val r = results().firstOrNull()
+                if (r != null) launch(r, this) else webSearch(text.toString().trim())
+                true
+            }
         }
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
