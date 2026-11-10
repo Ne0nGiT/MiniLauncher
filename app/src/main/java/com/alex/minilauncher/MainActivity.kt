@@ -21,6 +21,7 @@ import android.text.TextWatcher
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewTreeObserver
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.OvershootInterpolator
 import android.view.inputmethod.EditorInfo
@@ -184,6 +185,24 @@ class MainActivity : Activity() {
         }
     }
 
+    val pending = ArrayList<Pair<View, Int>>()
+
+    /** Chạy animation SAU khi layout xong, để không bị nuốt mất do khung hình đầu nặng. */
+    fun runPending() {
+        if (pending.isEmpty()) return
+        val list = ArrayList(pending); pending.clear()
+        scroll.viewTreeObserver.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                scroll.viewTreeObserver.removeOnPreDrawListener(this)
+                list.forEach { (v, i) ->
+                    v.animate().alpha(1f).translationY(0f).setStartDelay(minOf(i, 20) * 22L)
+                        .setDuration(380).setInterpolator(DecelerateInterpolator(1.6f)).start()
+                }
+                return true
+            }
+        })
+    }
+
     fun cell(a: AppItem, idx: Int, anim: Boolean): View {
         val s = prefs(); val size = dp(s.getInt("icon", 56))
         return LinearLayout(this).apply {
@@ -198,11 +217,7 @@ class MainActivity : Activity() {
             setOnClickListener { launch(a, it) }
             setOnLongClickListener { menu(a); true }
             pressAnim()
-            if (anim) {
-                alpha = 0f; translationY = dp(22).toFloat()
-                animate().alpha(1f).translationY(0f).setStartDelay(minOf(idx, 28) * 16L)
-                    .setDuration(280).setInterpolator(DecelerateInterpolator()).start()
-            }
+            if (anim && idx < 32) { alpha = 0f; translationY = dp(40).toFloat(); pending.add(Pair(this, idx)) }
         }
     }
 
@@ -242,6 +257,7 @@ class MainActivity : Activity() {
         }
         fill(allBox, results(), cols, anim && !searching, !searching, base)
         if (!searching) for (i in letters.indices) index.getChildAt(i).alpha = if (letterRow.containsKey(letters[i])) 1f else .3f
+        runPending()
     }
 
     fun build(): View {
