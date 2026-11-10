@@ -10,10 +10,12 @@ import android.content.Intent
 import android.content.pm.LauncherApps
 import android.content.pm.ShortcutInfo
 import android.content.res.ColorStateList
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Typeface
+import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
@@ -30,7 +32,9 @@ import android.text.Spanned
 import android.text.TextUtils
 import android.text.TextWatcher
 import android.text.style.RelativeSizeSpan
+import android.view.DragEvent
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewTreeObserver
@@ -169,6 +173,12 @@ class MainActivity : Activity() {
     val letters = ('A'..'Z').toList() + '#'
     val letterRow = HashMap<Char, View>()
     val pending = ArrayList<Pair<View, Int>>()
+    val dots = HashMap<String, ArrayList<View>>()
+    val iconCache = HashMap<String, Bitmap>()
+    var dragMoved = false
+    var dragHover = false
+    lateinit var useTitle: TextView
+    lateinit var useBox: LinearLayout
     lateinit var scroll: ScrollView
     lateinit var search: EditText
     lateinit var favTitle: TextView
@@ -191,8 +201,12 @@ class MainActivity : Activity() {
         override fun run() { updateClock(); handler.postDelayed(this, 1000 - System.currentTimeMillis() % 1000) }
     }
 
-    override fun onResume() { super.onResume(); setContentView(build()); load(); handler.removeCallbacks(tickR); handler.post(tickR) }
-    override fun onPause() { super.onPause(); handler.removeCallbacks(tickR) }
+    override fun onResume() {
+        super.onResume(); setContentView(build()); load()
+        handler.removeCallbacks(tickR); handler.post(tickR)
+        Notifs.onChange = { updateDots() }
+    }
+    override fun onPause() { super.onPause(); handler.removeCallbacks(tickR); Notifs.onChange = null }
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         if (::folderLayer.isInitialized) folderLayer.visibility = View.GONE
@@ -219,8 +233,65 @@ class MainActivity : Activity() {
         val q = query()
         return if (q.isEmpty()) { val h = hidden(); apps.filter { it.pkg !in h } } else apps.filter { norm(it.label).contains(q) }
     }
-    fun groups(list: List<AppItem>): List<Pair<String, List<AppItem>>> =
-        FOLDERS.mapNotNull { f -> list.filter { it.cat == f }.let { if (it.isEmpty()) null else Pair(f, it) } }
+    fun mapPref(k: String): MutableMap<String, String> {
+        val m = LinkedHashMap<String, String>()
+        prefs().getString(k, "")!!.split("\n").forEach { val i = it.indexOf('='); if (i > 0) m[it.substring(0, i)] = it.substring(i + 1) }
+        return m
+    }
+    fun saveMap(k: String, m: Map<String, String>) {
+        prefs().edit().putString(k, m.entries.joinToString("\n") { it.key + "=" + it.value }).apply()
+    }
+    fun customFolders() = prefs().getString("cfolders", "")!!.split("\n").filter { it.isNotEmpty() }
+    fun fname(id: String) = mapPref("fren")[id] ?: id
+
+    fun groups(list: List<AppItem>): List<Pair<String, List<AppItem>>> {
+        val cm = mapPref("catmap"); val order = FOLDERS + customFolders()
+        fun cat(a: AppItem): String { val c = cm[a.pkg]; return if (c != null && c in order) c else a.cat }
+        return order.mapNotNull { f -> list.filter { cat(it) == f }.let { if (it.isEmpty()) null else Pair(f, it) } }
+    }
+
+    fun usedApps(n: Int): List<AppItem> {
+        val all = prefs().all; val fav = favs(); val h = hidden()
+        return apps.filter { it.pkg !in h && it.pkg !in fav }
+            .map { Pair(it, (all["u_" + it.pkg] as? Int) ?: 0) }.filter { it.second > 0 }
+            .sortedByDescending { it.second }.take(n).map { it.first }
+    }
+
+    fun moveFav(src: String, dst: String) {
+        val f = favs().toMutableList(); val to = f.indexOf(dst)
+        if (to < 0 || !f.remove(src)) return
+        f.add(to, src); setList("favs", f)
+    }
+
+    /** Icon theo hình dạng người dùng chọn (có cache bitmap). */
+    fun icon(a: AppItem, size: Int): Drawable {
+        val p = prefs(); val shape = p.getInt("ishape", 0)
+        if (shape == 0) return a.dr()
+        val pct = p.getInt("icorner", 28)
+        val key = a.pkg + "|" + shape + "|" + pct + "|" + size
+        val bmp = iconCache.getOrPut(key) { if (iconCache.size > 900) iconCache.clear(); renderIcon(a.dr(), size, shape, pct) }
+        return BitmapDrawable(resources, bmp)
+    }
+
+    fun dotView(pkg: String): View {
+        val v = View(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL; setColor(fg)
+                setStroke(dp(2), if (Color.red(fg) > 128) Color.BLACK else Color.WHITE)
+            }
+            visibility = if ((Notifs.counts[pkg] ?: 0) > 0) View.VISIBLE else View.GONE
+        }
+        dots.getOrPut(pkg) { ArrayList() }.add(v)
+        return v
+    }
+
+    fun updateDots() {
+        val on = prefs().getBoolean("dots", false)
+        for ((k, l) in dots) {
+            val vis = if (on && (Notifs.counts[k] ?: 0) > 0) View.VISIBLE else View.GONE
+            l.forEach { it.visibility = vis }
+        }
+    }
 
     fun load() = Thread {
         val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
@@ -268,6 +339,7 @@ class MainActivity : Activity() {
     // ---------- hành động ----------
     fun launch(a: AppItem, v: View?) {
         val i = packageManager.getLaunchIntentForPackage(a.pkg) ?: return
+        prefs().edit().putInt("u_" + a.pkg, prefs().getInt("u_" + a.pkg, 0) + 1).apply()
         if (v != null && anim()) startActivity(i, ActivityOptions.makeScaleUpAnimation(v, 0, 0, v.width, v.height).toBundle())
         else startActivity(i)
     }
@@ -303,24 +375,25 @@ class MainActivity : Activity() {
     fun menu(a: AppItem) {
         val sc = shortcutsOf(a.pkg)
         val isFav = favs().contains(a.pkg); val isHid = hidden().contains(a.pkg)
-        val names = sc.map { "↗ " + (it.shortLabel ?: it.id) } + listOf(
-            if (isFav) "Bỏ khỏi Yêu thích" else "Thêm vào Yêu thích",
-            if (isHid) "Bỏ ẩn" else "Ẩn ứng dụng", "Thông tin ứng dụng", "Gỡ cài đặt")
-        AlertDialog.Builder(this).setTitle(a.label).setItems(names.toTypedArray()) { _, w ->
-            if (w < sc.size) {
-                try { (getSystemService(Context.LAUNCHER_APPS_SERVICE) as LauncherApps).startShortcut(sc[w], null, null) } catch (e: Exception) {}
-            } else when (w - sc.size) {
-                0 -> { val f = favs().toMutableList(); if (!f.remove(a.pkg)) f.add(a.pkg); setList("favs", f) }
-                1 -> {
-                    val h = hidden().toMutableList()
-                    if (!h.remove(a.pkg)) { h.add(a.pkg); prefs().edit().putString("favs", favs().filter { it != a.pkg }.joinToString(",")).apply() }
-                    setList("hidden", h)
-                }
-                2 -> startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${a.pkg}")))
-                3 -> startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${a.pkg}")))
-                else -> {}
+        val acts = ArrayList<Pair<String, () -> Unit>>()
+        fun add(t: String, f: () -> Unit) { acts.add(Pair(t, f)) }
+        sc.forEach { si ->
+            add("↗ " + (si.shortLabel ?: si.id)) {
+                try { (getSystemService(Context.LAUNCHER_APPS_SERVICE) as LauncherApps).startShortcut(si, null, null) } catch (e: Exception) {}
             }
-        }.show()
+        }
+        add(if (isFav) "Bỏ khỏi Yêu thích" else "Thêm vào Yêu thích") {
+            val f = favs().toMutableList(); if (!f.remove(a.pkg)) f.add(a.pkg); setList("favs", f)
+        }
+        add(if (isHid) "Bỏ ẩn" else "Ẩn ứng dụng") {
+            val h = hidden().toMutableList()
+            if (!h.remove(a.pkg)) { h.add(a.pkg); prefs().edit().putString("favs", favs().filter { it != a.pkg }.joinToString(",")).apply() }
+            setList("hidden", h)
+        }
+        if (prefs().getBoolean("folders", false)) add("Chuyển thư mục…") { chooseFolder(a) }
+        add("Thông tin ứng dụng") { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${a.pkg}"))) }
+        add("Gỡ cài đặt") { startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${a.pkg}"))) }
+        AlertDialog.Builder(this).setTitle(a.label).setItems(acts.map { it.first }.toTypedArray()) { _, w -> acts[w].second() }.show()
     }
 
     fun showMenu(anchor: View) {
@@ -337,10 +410,69 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- quản lý thư mục ----------
+    fun toastMsg(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
+
+    fun askName(title: String, initial: String, ok: (String) -> Unit) {
+        val et = EditText(this).apply { setText(initial); setSingleLine(); setPadding(dp(24), dp(16), dp(24), dp(16)) }
+        AlertDialog.Builder(this).setTitle(title).setView(et)
+            .setPositiveButton("OK") { _, _ -> ok(et.text.toString().trim()) }.setNegativeButton("Hủy", null).show()
+    }
+
+    fun nameTaken(n: String, except: String? = null): Boolean =
+        n in FOLDERS && n != except || (FOLDERS + customFolders()).any { it != except && fname(it).equals(n, true) }
+
+    fun setCat(pkg: String, id: String?) {
+        val m = mapPref("catmap"); if (id == null) m.remove(pkg) else m[pkg] = id
+        saveMap("catmap", m); folderLayer.visibility = View.GONE; refresh(false)
+    }
+
+    fun chooseFolder(a: AppItem) {
+        val ids = FOLDERS + customFolders()
+        val names = ids.map { fname(it) } + listOf("＋ Thư mục mới…", "↺ Về tự động")
+        AlertDialog.Builder(this).setTitle("Chuyển vào thư mục").setItems(names.toTypedArray()) { _, w ->
+            if (w < ids.size) setCat(a.pkg, ids[w])
+            else if (w == ids.size) askName("Tên thư mục mới", "") { n ->
+                if (n.isEmpty() || nameTaken(n)) toastMsg("Tên trống hoặc đã tồn tại")
+                else { prefs().edit().putString("cfolders", (customFolders() + n).joinToString("\n")).apply(); setCat(a.pkg, n) }
+            }
+            else setCat(a.pkg, null)
+        }.show()
+    }
+
+    fun renameFolder(id: String, n: String) {
+        if (n.isEmpty() || nameTaken(n, id)) { toastMsg("Tên trống hoặc đã tồn tại"); return }
+        if (id in FOLDERS) { val m = mapPref("fren"); if (n == id) m.remove(id) else m[id] = n; saveMap("fren", m) }
+        else {
+            prefs().edit().putString("cfolders", customFolders().map { if (it == id) n else it }.joinToString("\n")).apply()
+            val cm = mapPref("catmap"); for (k in cm.keys.toList()) if (cm[k] == id) cm[k] = n; saveMap("catmap", cm)
+        }
+        refresh(false)
+    }
+
+    fun deleteFolder(id: String) {
+        prefs().edit().putString("cfolders", customFolders().filter { it != id }.joinToString("\n")).apply()
+        val cm = mapPref("catmap"); cm.entries.removeAll { it.value == id }; saveMap("catmap", cm); refresh(false)
+    }
+
+    fun folderMenu(id: String) {
+        val custom = id !in FOLDERS
+        val renamed = mapPref("fren").containsKey(id)
+        val opts = ArrayList<String>(); opts.add("Đổi tên")
+        if (custom) opts.add("Xóa thư mục") else if (renamed) opts.add("Khôi phục tên gốc")
+        AlertDialog.Builder(this).setTitle(fname(id)).setItems(opts.toTypedArray()) { _, w ->
+            when (w) {
+                0 -> askName("Đổi tên thư mục", fname(id)) { n -> renameFolder(id, n) }
+                1 -> if (custom) deleteFolder(id) else { val m = mapPref("fren"); m.remove(id); saveMap("fren", m); refresh(false) }
+                else -> {}
+            }
+        }.show()
+    }
+
     // ---------- thư mục ----------
     fun openFolder(name: String, items: List<AppItem>) {
         val cols = prefs().getInt("cols", 4)
-        folderTitle.text = name
+        folderTitle.text = fname(name)
         fill(folderBox, items, cols, false, false, 0)
         val cellH = dp(prefs().getInt("icon", 56)) + dp(52)
         val rows = (items.size + cols - 1) / cols
@@ -381,20 +513,53 @@ class MainActivity : Activity() {
         if (anim && idx < 32) { v.alpha = 0f; v.translationY = dp(40).toFloat(); pending.add(Pair(v, idx)) }
     }
 
-    fun cell(a: AppItem, idx: Int, anim: Boolean): View {
+    fun cell(a: AppItem, idx: Int, anim: Boolean, fav: Boolean = false): View {
         val s = prefs(); val size = dp(s.getInt("icon", 56))
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
             setPadding(0, dp(8), 0, dp(8))
-            addView(ImageView(context).apply { setImageDrawable(a.dr()) }, LinearLayout.LayoutParams(size, size))
+            val box = FrameLayout(context)
+            box.addView(ImageView(context).apply { setImageDrawable(icon(a, size)) }, FrameLayout.LayoutParams(size, size))
+            if (s.getBoolean("dots", false))
+                box.addView(dotView(a.pkg), FrameLayout.LayoutParams(dp(12), dp(12), Gravity.TOP or Gravity.END))
+            addView(box, LinearLayout.LayoutParams(size, size))
             if (s.getBoolean("labels", true)) addView(label(a.label, 1))
             setOnClickListener { launch(a, it) }
-            setOnLongClickListener { menu(a); true }
+            if (fav) {
+                setOnLongClickListener { v ->
+                    dragMoved = false; dragHover = false
+                    v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                    v.startDragAndDrop(ClipData.newPlainText("fav", a.pkg), View.DragShadowBuilder(v), a.pkg, 0)
+                    true
+                }
+                setOnDragListener { v, e ->
+                    when (e.action) {
+                        DragEvent.ACTION_DRAG_STARTED -> e.localState is String
+                        DragEvent.ACTION_DRAG_ENTERED -> {
+                            if (e.localState != a.pkg) { dragHover = true; v.animate().scaleX(1.12f).scaleY(1.12f).setDuration(120).start() }
+                            true
+                        }
+                        DragEvent.ACTION_DRAG_EXITED -> { v.animate().scaleX(1f).scaleY(1f).setDuration(120).start(); true }
+                        DragEvent.ACTION_DROP -> {
+                            v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+                            val src = e.localState as? String
+                            if (src != null && src != a.pkg) { dragMoved = true; moveFav(src, a.pkg) }
+                            true
+                        }
+                        DragEvent.ACTION_DRAG_ENDED -> {
+                            v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+                            if (e.localState == a.pkg && !dragMoved && !dragHover) menu(a)
+                            true
+                        }
+                        else -> true
+                    }
+                }
+            } else setOnLongClickListener { menu(a); true }
             pressAnim(); intro(this, idx, anim)
         }
     }
 
-    fun folderCell(name: String, items: List<AppItem>, idx: Int, anim: Boolean): View {
+    fun folderCell(id: String, items: List<AppItem>, idx: Int, anim: Boolean): View {
         val s = prefs(); val size = dp(s.getInt("icon", 56))
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
@@ -407,13 +572,14 @@ class MainActivity : Activity() {
                 for (r in 0..1) addView(LinearLayout(context).apply {
                     for (c in 0..1) {
                         val a = items.getOrNull(r * 2 + c)
-                        addView(ImageView(context).apply { if (a != null) setImageDrawable(a.dr()) }, LinearLayout.LayoutParams(m, m))
+                        addView(ImageView(context).apply { if (a != null) setImageDrawable(icon(a, m)) }, LinearLayout.LayoutParams(m, m))
                     }
                 })
             }
             addView(tile, LinearLayout.LayoutParams(size, size))
-            if (s.getBoolean("labels", true)) addView(label(name, 2))
-            setOnClickListener { openFolder(name, items) }
+            if (s.getBoolean("labels", true)) addView(label(fname(id), 2))
+            setOnClickListener { openFolder(id, items) }
+            setOnLongClickListener { folderMenu(id); true }
             pressAnim(); intro(this, idx, anim)
         }
     }
@@ -428,8 +594,8 @@ class MainActivity : Activity() {
         return row
     }
 
-    fun appRow(items: List<AppItem>, r: Int, cols: Int, anim: Boolean, track: Boolean, base: Int): View {
-        val row = rowOf(items.size, r, cols) { k -> cell(items[k], k + base, anim) }
+    fun appRow(items: List<AppItem>, r: Int, cols: Int, anim: Boolean, track: Boolean, base: Int, fav: Boolean = false): View {
+        val row = rowOf(items.size, r, cols) { k -> cell(items[k], k + base, anim, fav) }
         if (track) for (k in r * cols until minOf(items.size, (r + 1) * cols)) {
             val ch = letterOf(items[k].label)
             if (!letterRow.containsKey(ch)) letterRow[ch] = row
@@ -437,9 +603,9 @@ class MainActivity : Activity() {
         return row
     }
 
-    fun fill(box: LinearLayout, items: List<AppItem>, cols: Int, anim: Boolean, track: Boolean, base: Int) {
+    fun fill(box: LinearLayout, items: List<AppItem>, cols: Int, anim: Boolean, track: Boolean, base: Int, fav: Boolean = false) {
         box.removeAllViews(); if (track) letterRow.clear()
-        for (r in 0 until (items.size + cols - 1) / cols) box.addView(appRow(items, r, cols, anim, track, base))
+        for (r in 0 until (items.size + cols - 1) / cols) box.addView(appRow(items, r, cols, anim, track, base, fav))
     }
 
     /** Dựng 7 hàng đầu ngay, phần còn lại chia nhỏ từng đợt để giao diện (và vòng loading) không bị đứng. */
@@ -474,7 +640,10 @@ class MainActivity : Activity() {
         clockBox.visibility = if (searching || !p.getBoolean("clock", true)) View.GONE else View.VISIBLE
         allTitle.text = if (folderMode) "Thư mục" else "Tất cả ứng dụng"
         val favList = if (searching) emptyList() else favApps()
-        val base = minOf(favList.size, 8)
+        val useList = if (searching || !p.getBoolean("usedsec", true)) emptyList() else usedApps(cols)
+        val useVis = if (useList.isEmpty()) View.GONE else View.VISIBLE
+        useTitle.visibility = useVis; useBox.visibility = useVis
+        val base = minOf(favList.size + useList.size, 8)
         if (!searching) {
             if (favList.isEmpty()) {
                 favBox.removeAllViews()
@@ -482,8 +651,9 @@ class MainActivity : Activity() {
                     text = "Nhấn giữ một app để thêm vào đây"; setTextColor(fg); alpha = .5f
                     textSize = 13f; setPadding(dp(8), 0, 0, dp(4))
                 })
-            } else fill(favBox, favList, cols, anim, false, 0)
+            } else fill(favBox, favList, cols, anim, false, 0, true)
         }
+        if (useList.isNotEmpty()) fill(useBox, useList, cols, anim, false, favList.size)
         val list = results()
         if (folderMode) {
             allBox.removeAllViews()
@@ -507,14 +677,16 @@ class MainActivity : Activity() {
     // ---------- dựng giao diện ----------
     fun build(): View {
         fg = setupWindow()
+        dots.clear()
         val p = prefs()
         val soft = alphaOf(fg, 0x26)
         fun sec(t: String) = TextView(this).apply {
             text = t; setTextColor(fg); textSize = 15f; setPadding(dp(8), dp(16), 0, dp(10))
         }
-        favTitle = sec("Yêu thích"); allTitle = sec("Tất cả ứng dụng")
+        favTitle = sec("Yêu thích"); useTitle = sec("Hay dùng"); allTitle = sec("Tất cả ứng dụng")
         favBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         allBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        useBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         val fonts = arrayOf("sans-serif-thin", "sans-serif-light", "sans-serif", "sans-serif-black", "monospace")
         val fi = p.getInt("cfont", 1).coerceIn(0, 4)
@@ -538,7 +710,7 @@ class MainActivity : Activity() {
         }
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setPadding(dp(14), 0, dp(26), dp(24))
-            addView(clockBox); addView(favTitle); addView(favBox); addView(allTitle); addView(allBox)
+            addView(clockBox); addView(favTitle); addView(favBox); addView(useTitle); addView(useBox); addView(allTitle); addView(allBox)
         }
         scroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false; addView(content) }
 

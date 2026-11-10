@@ -14,12 +14,15 @@ import android.graphics.Typeface
 import android.graphics.drawable.ClipDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
+import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.view.ViewOutlineProvider
 import android.widget.*
+import org.json.JSONArray
+import org.json.JSONObject
 
 typealias LP = LinearLayout.LayoutParams
 
@@ -220,10 +223,34 @@ class SettingsActivity : Activity() {
 
         col.addView(section("MÀN HÌNH CHÍNH"))
         col.addView(sw("Tự động chia thư mục", "folders", false))
+        col.addView(sw("Hiện mục Hay dùng", "usedsec", true))
+        col.addView(btn("Xóa lịch sử Hay dùng") {
+            val ed = s.edit(); s.all.keys.filter { it.startsWith("u_") }.forEach { ed.remove(it) }; ed.apply()
+            toast("Đã xóa lịch sử")
+        })
         col.addView(seek("Số cột", "cols", 3, 6, 4, ""))
-        col.addView(seek("Cỡ biểu tượng", "icon", 36, 80, 56, "dp"))
         col.addView(sw("Hiện tên ứng dụng", "labels", true))
         col.addView(sw("Hiệu ứng chuyển động", "anim", true))
+
+        col.addView(section("BIỂU TƯỢNG"))
+        col.addView(chips("Hình dạng icon", "ishape", listOf("Gốc", "Tròn", "Vuông bo", "Squircle"), 0))
+        col.addView(seek("Độ bo góc (Vuông bo)", "icorner", 0, 50, 28, "%"))
+        col.addView(seek("Cỡ biểu tượng", "icon", 36, 80, 56, "dp"))
+
+        col.addView(section("THÔNG BÁO"))
+        col.addView(sw("Dấu chấm thông báo", "dots", false))
+        col.addView(btn("Cấp / quản lý quyền đọc thông báo") {
+            try { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) } catch (e: Exception) { toast("Máy không mở được trang này") }
+        })
+
+        col.addView(section("SAO LƯU"))
+        col.addView(btn("Sao lưu cài đặt ra file") {
+            startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("application/json").putExtra(Intent.EXTRA_TITLE, "minilauncher-backup.json"), 101)
+        })
+        col.addView(btn("Khôi phục cài đặt từ file") {
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), 102)
+        })
 
         col.addView(section("ĐỒNG HỒ"))
         col.addView(sw("Hiện đồng hồ", "clock", true))
@@ -246,5 +273,47 @@ class SettingsActivity : Activity() {
             try { startActivity(Intent(Settings.ACTION_HOME_SETTINGS)) } catch (e: Exception) {}
         })
         setContentView(ScrollView(this).apply { addView(col) })
+    }
+
+    override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+        super.onActivityResult(req, res, data)
+        if (res != RESULT_OK) return
+        val uri: Uri = data?.data ?: return
+        val s = prefs()
+        try {
+            if (req == 101) {
+                val o = JSONObject()
+                for ((k, v) in s.all) {
+                    val e = JSONObject()
+                    when (v) {
+                        is Boolean -> { e.put("t", "b"); e.put("v", v) }
+                        is Int -> { e.put("t", "i"); e.put("v", v) }
+                        is Long -> { e.put("t", "l"); e.put("v", v) }
+                        is Float -> { e.put("t", "f"); e.put("v", v.toDouble()) }
+                        is String -> { e.put("t", "s"); e.put("v", v) }
+                        is Set<*> -> { e.put("t", "ss"); e.put("v", JSONArray(v.map { it.toString() })) }
+                        else -> continue
+                    }
+                    o.put(k, e)
+                }
+                contentResolver.openOutputStream(uri)?.use { it.write(o.toString().toByteArray(Charsets.UTF_8)) }
+                Toast.makeText(this, "Đã sao lưu", Toast.LENGTH_SHORT).show()
+            } else if (req == 102) {
+                val txt = contentResolver.openInputStream(uri)!!.use { it.readBytes().toString(Charsets.UTF_8) }
+                val o = JSONObject(txt); val ed = s.edit().clear()
+                o.keys().forEach { k ->
+                    val e = o.getJSONObject(k)
+                    when (e.getString("t")) {
+                        "b" -> ed.putBoolean(k, e.getBoolean("v"))
+                        "i" -> ed.putInt(k, e.getInt("v"))
+                        "l" -> ed.putLong(k, e.getLong("v"))
+                        "f" -> ed.putFloat(k, e.getDouble("v").toFloat())
+                        "s" -> ed.putString(k, e.getString("v"))
+                        "ss" -> { val ar = e.getJSONArray("v"); ed.putStringSet(k, (0 until ar.length()).map { ar.getString(it) }.toSet()) }
+                    }
+                }
+                ed.apply(); Toast.makeText(this, "Đã khôi phục", Toast.LENGTH_SHORT).show(); recreate()
+            }
+        } catch (e: Exception) { Toast.makeText(this, "Lỗi: ${e.message}", Toast.LENGTH_LONG).show() }
     }
 }
