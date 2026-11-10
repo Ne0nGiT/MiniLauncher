@@ -59,6 +59,11 @@ object Wall {
 
     fun thumb(id: String): Bitmap = render(id, 90, 160)
 
+    fun full(ctx: Context, id: String): Bitmap {
+        val dm = ctx.resources.displayMetrics
+        return render(id, dm.widthPixels, dm.heightPixels)
+    }
+
     private fun grad(x0: Float, y0: Float, x1: Float, y1: Float, vararg colors: Int) =
         Paint().apply { shader = LinearGradient(x0, y0, x1, y1, colors, null, Shader.TileMode.CLAMP) }
 

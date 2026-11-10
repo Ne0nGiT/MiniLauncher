@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.LauncherApps
 import android.content.pm.ShortcutInfo
+import android.content.res.ColorStateList
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -18,12 +19,17 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.Process
 import android.provider.AlarmClock
 import android.provider.Settings
 import android.text.Editable
+import android.text.SpannableStringBuilder
+import android.text.Spanned
 import android.text.TextUtils
 import android.text.TextWatcher
+import android.text.style.RelativeSizeSpan
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -34,13 +40,17 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.*
 import java.text.Normalizer
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-class AppItem(val label: String, val pkg: String, val icon: Drawable) {
+class AppItem(val label: String, val pkg: String, val icon: Drawable, val cat: String = "Khác") {
     fun dr(): Drawable = icon.constantState?.newDrawable() ?: icon
 }
 
 fun Context.dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 fun Context.prefs() = getSharedPreferences("p", 0)
+fun alphaOf(c: Int, a: Int) = Color.argb(a, Color.red(c), Color.green(c), Color.blue(c))
 fun norm(s: String) = Normalizer.normalize(s.lowercase(), Normalizer.Form.NFD)
     .replace(Regex("\\p{M}+"), "").replace('đ', 'd')
 fun letterOf(s: String): Char {
@@ -82,7 +92,7 @@ fun calc(q: String): String? {
     val v = Calc(s).eval() ?: return null
     if (v.isNaN() || v.isInfinite()) return null
     return if (v == Math.floor(v) && Math.abs(v) < 1e15) v.toLong().toString()
-    else String.format(java.util.Locale.US, "%.8f", v).trimEnd('0').trimEnd('.')
+    else String.format(Locale.US, "%.8f", v).trimEnd('0').trimEnd('.')
 }
 
 /** Nền theo cài đặt (plain = màn Cài đặt: nền riêng, không lộ hình nền hệ thống). Trả về màu chữ. */
@@ -125,16 +135,6 @@ fun View.pressAnim() {
     }
 }
 
-fun Context.pill(t: String, fg: Int, onClick: () -> Unit) = TextView(this).apply {
-    text = t; setTextColor(fg); textSize = 15f; gravity = Gravity.CENTER
-    setPadding(dp(14), dp(14), dp(14), dp(14))
-    background = GradientDrawable().apply {
-        cornerRadius = dp(24).toFloat(); setColor(Color.argb(0x26, Color.red(fg), Color.green(fg), Color.blue(fg)))
-    }
-    setOnClickListener { onClick() }
-    pressAnim()
-}
-
 /** Icon vẽ tay: 0 = tìm kiếm, 1 = ba chấm, 2 = quay lại */
 class Ic(ctx: Context, val kind: Int, val color: Int) : View(ctx) {
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -164,8 +164,11 @@ class Ic(ctx: Context, val kind: Int, val color: Int) : View(ctx) {
 class MainActivity : Activity() {
     var apps = listOf<AppItem>()
     var fg = Color.WHITE
+    var gen = 0
+    val handler = Handler(Looper.getMainLooper())
     val letters = ('A'..'Z').toList() + '#'
     val letterRow = HashMap<Char, View>()
+    val pending = ArrayList<Pair<View, Int>>()
     lateinit var scroll: ScrollView
     lateinit var search: EditText
     lateinit var favTitle: TextView
@@ -175,10 +178,29 @@ class MainActivity : Activity() {
     lateinit var index: LinearLayout
     lateinit var bubble: TextView
     lateinit var clockBox: LinearLayout
+    lateinit var clockTv: TextView
+    lateinit var dateTv: TextView
+    lateinit var loading: ProgressBar
+    lateinit var folderLayer: FrameLayout
+    lateinit var folderCard: LinearLayout
+    lateinit var folderTitle: TextView
+    lateinit var folderBox: LinearLayout
+    lateinit var folderScroll: ScrollView
 
-    override fun onResume() { super.onResume(); setContentView(build()); load() }
-    override fun onNewIntent(intent: Intent?) { super.onNewIntent(intent); reset() }
-    override fun onBackPressed() { reset() }
+    val tickR = object : Runnable {
+        override fun run() { updateClock(); handler.postDelayed(this, 1000 - System.currentTimeMillis() % 1000) }
+    }
+
+    override fun onResume() { super.onResume(); setContentView(build()); load(); handler.removeCallbacks(tickR); handler.post(tickR) }
+    override fun onPause() { super.onPause(); handler.removeCallbacks(tickR) }
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        if (::folderLayer.isInitialized) folderLayer.visibility = View.GONE
+        reset()
+    }
+    override fun onBackPressed() {
+        if (::folderLayer.isInitialized && folderLayer.visibility == View.VISIBLE) closeFolder() else reset()
+    }
 
     fun reset() {
         if (!::search.isInitialized) return
@@ -193,18 +215,57 @@ class MainActivity : Activity() {
     fun favApps(): List<AppItem> { val h = hidden(); return favs().mapNotNull { p -> apps.find { it.pkg == p && it.pkg !in h } } }
     fun setList(k: String, l: List<String>) { prefs().edit().putString(k, l.joinToString(",")).apply(); refresh(false) }
     fun query() = norm(search.text.toString().trim())
-    fun results(): List<AppItem> { val q = query(); return if (q.isEmpty()) { val h = hidden(); apps.filter { it.pkg !in h } } else apps.filter { norm(it.label).contains(q) } }
+    fun results(): List<AppItem> {
+        val q = query()
+        return if (q.isEmpty()) { val h = hidden(); apps.filter { it.pkg !in h } } else apps.filter { norm(it.label).contains(q) }
+    }
+    fun groups(list: List<AppItem>): List<Pair<String, List<AppItem>>> =
+        FOLDERS.mapNotNull { f -> list.filter { it.cat == f }.let { if (it.isEmpty()) null else Pair(f, it) } }
 
     fun load() = Thread {
         val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         val list = packageManager.queryIntentActivities(i, 0)
             .filter { it.activityInfo.packageName != packageName }
-            .map { AppItem(it.loadLabel(packageManager).toString(), it.activityInfo.packageName, it.loadIcon(packageManager)) }
+            .map {
+                val lb = it.loadLabel(packageManager).toString()
+                AppItem(lb, it.activityInfo.packageName, it.loadIcon(packageManager),
+                    classify(it.activityInfo.packageName, lb, it.activityInfo.applicationInfo))
+            }
             .distinctBy { it.pkg }
             .sortedWith(compareBy<AppItem>({ letterOf(it.label) == '#' }, { norm(it.label) }))
-        runOnUiThread { if (list.map { it.pkg } != apps.map { it.pkg }) { apps = list; refresh(true) } }
+        runOnUiThread {
+            if (list.map { it.pkg } != apps.map { it.pkg }) { apps = list; refresh(true) }
+            else if (::loading.isInitialized) loading.visibility = View.GONE
+        }
     }.start()
 
+    // ---------- đồng hồ ----------
+    fun fmt(pat: String, d: Date) = SimpleDateFormat(pat, Locale.getDefault()).format(d)
+
+    fun updateClock() {
+        if (!::clockTv.isInitialized) return
+        val p = prefs(); val now = Date()
+        val h24 = p.getBoolean("c24", true); val showH = p.getBoolean("ch", true)
+        val parts = ArrayList<String>()
+        if (showH) parts.add(fmt(if (h24) "HH" else "hh", now))
+        if (p.getBoolean("cm", true)) parts.add(fmt("mm", now))
+        val sb = SpannableStringBuilder(parts.joinToString(":"))
+        if (p.getBoolean("cs", true)) {
+            val st = sb.length
+            sb.append(if (st == 0) fmt("ss", now) else ":" + fmt("ss", now))
+            if (st > 0 && p.getBoolean("csmall", true)) sb.setSpan(RelativeSizeSpan(0.45f), st, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        if (!h24 && showH && sb.isNotEmpty()) {
+            val st = sb.length
+            sb.append(" " + fmt("a", now)); sb.setSpan(RelativeSizeSpan(0.4f), st, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        clockTv.text = sb
+        clockTv.visibility = if (sb.isEmpty()) View.GONE else View.VISIBLE
+        val pats = arrayOf("EEEE, d MMMM", "EEE, d/M", "EEEE, d MMMM yyyy", "dd/MM/yyyy")
+        dateTv.text = fmt(pats[p.getInt("cdf", 0).coerceIn(0, 3)], now)
+    }
+
+    // ---------- hành động ----------
     fun launch(a: AppItem, v: View?) {
         val i = packageManager.getLaunchIntentForPackage(a.pkg) ?: return
         if (v != null && anim()) startActivity(i, ActivityOptions.makeScaleUpAnimation(v, 0, 0, v.width, v.height).toBundle())
@@ -234,7 +295,7 @@ class MainActivity : Activity() {
 
     fun row(t: String, onClick: () -> Unit) = TextView(this).apply {
         text = t; setTextColor(fg); textSize = 16f; setPadding(dp(16), dp(14), dp(16), dp(14))
-        background = GradientDrawable().apply { cornerRadius = dp(20).toFloat(); setColor(Color.argb(0x26, Color.red(fg), Color.green(fg), Color.blue(fg))) }
+        background = GradientDrawable().apply { cornerRadius = dp(20).toFloat(); setColor(alphaOf(fg, 0x26)) }
         layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) }
         setOnClickListener { onClick() }; pressAnim()
     }
@@ -276,9 +337,25 @@ class MainActivity : Activity() {
         }
     }
 
-    val pending = ArrayList<Pair<View, Int>>()
+    // ---------- thư mục ----------
+    fun openFolder(name: String, items: List<AppItem>) {
+        val cols = prefs().getInt("cols", 4)
+        folderTitle.text = name
+        fill(folderBox, items, cols, false, false, 0)
+        val cellH = dp(prefs().getInt("icon", 56)) + dp(52)
+        val rows = (items.size + cols - 1) / cols
+        folderScroll.layoutParams = LinearLayout.LayoutParams(-1, minOf(rows * cellH, (resources.displayMetrics.heightPixels * 0.55f).toInt()))
+        folderLayer.visibility = View.VISIBLE
+        folderLayer.alpha = 0f; folderLayer.animate().alpha(1f).setDuration(180).start()
+        folderCard.scaleX = .85f; folderCard.scaleY = .85f
+        folderCard.animate().scaleX(1f).scaleY(1f).setDuration(260).setInterpolator(OvershootInterpolator(1.1f)).start()
+    }
 
-    /** Chạy animation SAU khi layout xong, để không bị nuốt mất do khung hình đầu nặng. */
+    fun closeFolder() {
+        folderLayer.animate().alpha(0f).setDuration(140).withEndAction { folderLayer.visibility = View.GONE }.start()
+    }
+
+    // ---------- ô app / thư mục ----------
     fun runPending() {
         if (pending.isEmpty()) return
         val list = ArrayList(pending); pending.clear()
@@ -294,87 +371,168 @@ class MainActivity : Activity() {
         })
     }
 
+    fun label(t: String, lines: Int) = TextView(this).apply {
+        text = t; setTextColor(fg); textSize = 11.5f; maxLines = lines
+        ellipsize = TextUtils.TruncateAt.END; gravity = Gravity.CENTER
+        setPadding(dp(2), dp(4), dp(2), 0)
+    }
+
+    fun intro(v: View, idx: Int, anim: Boolean) {
+        if (anim && idx < 32) { v.alpha = 0f; v.translationY = dp(40).toFloat(); pending.add(Pair(v, idx)) }
+    }
+
     fun cell(a: AppItem, idx: Int, anim: Boolean): View {
         val s = prefs(); val size = dp(s.getInt("icon", 56))
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
             setPadding(0, dp(8), 0, dp(8))
             addView(ImageView(context).apply { setImageDrawable(a.dr()) }, LinearLayout.LayoutParams(size, size))
-            if (s.getBoolean("labels", true)) addView(TextView(context).apply {
-                text = a.label; setTextColor(fg); textSize = 11.5f; maxLines = 1
-                ellipsize = TextUtils.TruncateAt.END; gravity = Gravity.CENTER
-                setPadding(dp(2), dp(4), dp(2), 0)
-            })
+            if (s.getBoolean("labels", true)) addView(label(a.label, 1))
             setOnClickListener { launch(a, it) }
             setOnLongClickListener { menu(a); true }
-            pressAnim()
-            if (anim && idx < 32) { alpha = 0f; translationY = dp(40).toFloat(); pending.add(Pair(this, idx)) }
+            pressAnim(); intro(this, idx, anim)
         }
+    }
+
+    fun folderCell(name: String, items: List<AppItem>, idx: Int, anim: Boolean): View {
+        val s = prefs(); val size = dp(s.getInt("icon", 56))
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, dp(8), 0, dp(8))
+            val tile = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+                setPadding(dp(5), dp(5), dp(5), dp(5))
+                background = GradientDrawable().apply { cornerRadius = size * 0.28f; setColor(alphaOf(fg, 0x30)) }
+                val m = (size - dp(10)) / 2
+                for (r in 0..1) addView(LinearLayout(context).apply {
+                    for (c in 0..1) {
+                        val a = items.getOrNull(r * 2 + c)
+                        addView(ImageView(context).apply { if (a != null) setImageDrawable(a.dr()) }, LinearLayout.LayoutParams(m, m))
+                    }
+                })
+            }
+            addView(tile, LinearLayout.LayoutParams(size, size))
+            if (s.getBoolean("labels", true)) addView(label(name, 2))
+            setOnClickListener { openFolder(name, items) }
+            pressAnim(); intro(this, idx, anim)
+        }
+    }
+
+    fun rowOf(n: Int, r: Int, cols: Int, cellAt: (Int) -> View): LinearLayout {
+        val row = LinearLayout(this)
+        for (c in 0 until cols) {
+            val k = r * cols + c
+            if (k < n) row.addView(cellAt(k), LinearLayout.LayoutParams(0, -2, 1f))
+            else row.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        }
+        return row
+    }
+
+    fun appRow(items: List<AppItem>, r: Int, cols: Int, anim: Boolean, track: Boolean, base: Int): View {
+        val row = rowOf(items.size, r, cols) { k -> cell(items[k], k + base, anim) }
+        if (track) for (k in r * cols until minOf(items.size, (r + 1) * cols)) {
+            val ch = letterOf(items[k].label)
+            if (!letterRow.containsKey(ch)) letterRow[ch] = row
+        }
+        return row
     }
 
     fun fill(box: LinearLayout, items: List<AppItem>, cols: Int, anim: Boolean, track: Boolean, base: Int) {
-        box.removeAllViews()
-        if (track) letterRow.clear()
-        var i = 0
-        while (i < items.size) {
-            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-            for (c in 0 until cols) {
-                val k = i + c
-                if (k < items.size) {
-                    row.addView(cell(items[k], k + base, anim), LinearLayout.LayoutParams(0, -2, 1f))
-                    val ch = letterOf(items[k].label)
-                    if (track && !letterRow.containsKey(ch)) letterRow[ch] = row
-                } else row.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        box.removeAllViews(); if (track) letterRow.clear()
+        for (r in 0 until (items.size + cols - 1) / cols) box.addView(appRow(items, r, cols, anim, track, base))
+    }
+
+    /** Dựng 7 hàng đầu ngay, phần còn lại chia nhỏ từng đợt để giao diện (và vòng loading) không bị đứng. */
+    fun fillChunked(box: LinearLayout, items: List<AppItem>, cols: Int, anim: Boolean, track: Boolean, base: Int, g: Int, done: () -> Unit) {
+        box.removeAllViews(); if (track) letterRow.clear()
+        val total = (items.size + cols - 1) / cols
+        val first = minOf(total, 7)
+        for (r in 0 until first) box.addView(appRow(items, r, cols, anim, track, base))
+        if (first >= total) { done(); return }
+        var next = first
+        val step = object : Runnable {
+            override fun run() {
+                if (g != gen) return
+                val end = minOf(total, next + 5)
+                for (r in next until end) box.addView(appRow(items, r, cols, false, track, base))
+                next = end
+                if (next >= total) done() else handler.postDelayed(this, 12)
             }
-            box.addView(row); i += cols
         }
+        handler.postDelayed(step, 12)
     }
 
     fun refresh(anim: Boolean) {
+        val g = ++gen
+        val p = prefs()
         val searching = query().isNotEmpty()
-        val cols = prefs().getInt("cols", 4)
+        val folderMode = !searching && p.getBoolean("folders", false)
+        val cols = p.getInt("cols", 4)
         val vis = if (searching) View.GONE else View.VISIBLE
-        favTitle.visibility = vis; favBox.visibility = vis; allTitle.visibility = vis; index.visibility = vis
-        clockBox.visibility = if (searching || !prefs().getBoolean("clock", true)) View.GONE else View.VISIBLE
-        var base = 0
+        favTitle.visibility = vis; favBox.visibility = vis; allTitle.visibility = vis
+        index.visibility = if (searching || folderMode) View.GONE else View.VISIBLE
+        clockBox.visibility = if (searching || !p.getBoolean("clock", true)) View.GONE else View.VISIBLE
+        allTitle.text = if (folderMode) "Thư mục" else "Tất cả ứng dụng"
+        val favList = if (searching) emptyList() else favApps()
+        val base = minOf(favList.size, 8)
         if (!searching) {
-            val f = favApps(); base = minOf(f.size, 8)
-            if (f.isEmpty()) {
+            if (favList.isEmpty()) {
                 favBox.removeAllViews()
                 favBox.addView(TextView(this).apply {
                     text = "Nhấn giữ một app để thêm vào đây"; setTextColor(fg); alpha = .5f
                     textSize = 13f; setPadding(dp(8), 0, 0, dp(4))
                 })
-            } else fill(favBox, f, cols, anim, false, 0)
+            } else fill(favBox, favList, cols, anim, false, 0)
         }
-        fill(allBox, results(), cols, anim && !searching, !searching, base)
+        val list = results()
+        if (folderMode) {
+            allBox.removeAllViews()
+            val gr = groups(list)
+            for (r in 0 until (gr.size + cols - 1) / cols)
+                allBox.addView(rowOf(gr.size, r, cols) { k -> folderCell(gr[k].first, gr[k].second, k + base, anim) })
+        } else {
+            fillChunked(allBox, list, cols, anim && !searching, !searching, base, g) {
+                if (!searching) for (i in letters.indices) index.getChildAt(i).alpha = if (letterRow.containsKey(letters[i])) 1f else .3f
+            }
+        }
+        loading.visibility = View.GONE
+        runPending()
         if (searching) {
             val q = search.text.toString().trim()
             allBox.addView(row("Tìm “$q” trên Google") { webSearch(q) }, 0)
             calc(q)?.let { r -> allBox.addView(row("= $r") { copy(r) }, 0) }
         }
-        if (!searching) for (i in letters.indices) index.getChildAt(i).alpha = if (letterRow.containsKey(letters[i])) 1f else .3f
-        runPending()
     }
 
+    // ---------- dựng giao diện ----------
     fun build(): View {
         fg = setupWindow()
-        val soft = Color.argb(0x26, Color.red(fg), Color.green(fg), Color.blue(fg))
+        val p = prefs()
+        val soft = alphaOf(fg, 0x26)
         fun sec(t: String) = TextView(this).apply {
             text = t; setTextColor(fg); textSize = 15f; setPadding(dp(8), dp(16), 0, dp(10))
         }
         favTitle = sec("Yêu thích"); allTitle = sec("Tất cả ứng dụng")
         favBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         allBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        val fonts = arrayOf("sans-serif-thin", "sans-serif-light", "sans-serif", "sans-serif-black", "monospace")
+        val fi = p.getInt("cfont", 1).coerceIn(0, 4)
+        val ccol = p.getInt("ccol", 0); val dcol = p.getInt("dcol", 0)
+        clockTv = TextView(this).apply {
+            setTextColor(if (ccol == 0) fg else ccol); textSize = p.getInt("csize", 54).toFloat()
+            typeface = Typeface.create(fonts[fi], Typeface.NORMAL); includeFontPadding = false
+        }
+        dateTv = TextView(this).apply {
+            setTextColor(if (dcol == 0) fg else dcol); alpha = if (dcol == 0) .7f else 1f
+            textSize = p.getInt("dsize", 15).toFloat(); typeface = if (fi == 4) Typeface.MONOSPACE else Typeface.DEFAULT
+            setPadding(0, dp(4), 0, 0)
+            visibility = if (p.getBoolean("cdate", true)) View.VISIBLE else View.GONE
+        }
         clockBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(20), 0, dp(4))
-            addView(TextClock(context).apply {
-                format24Hour = "HH:mm"; format12Hour = "HH:mm"; setTextColor(fg); textSize = 54f
-                typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
-            })
-            addView(TextClock(context).apply {
-                format24Hour = "EEEE, d MMMM"; format12Hour = "EEEE, d MMMM"; setTextColor(fg); alpha = .7f; textSize = 15f
-            })
+            orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(20), dp(8), dp(4))
+            gravity = when (p.getInt("calign", 0)) { 1 -> Gravity.CENTER_HORIZONTAL; 2 -> Gravity.END; else -> Gravity.START }
+            addView(clockTv); addView(dateTv)
             setOnClickListener { try { startActivity(Intent(AlarmClock.ACTION_SHOW_ALARMS)) } catch (e: Exception) {} }
             pressAnim()
         }
@@ -386,7 +544,7 @@ class MainActivity : Activity() {
 
         search = EditText(this).apply {
             hint = "Tìm kiếm"; setTextColor(fg); textSize = 16f
-            setHintTextColor(Color.argb(140, Color.red(fg), Color.green(fg), Color.blue(fg)))
+            setHintTextColor(alphaOf(fg, 140))
             background = null; setSingleLine(); imeOptions = EditorInfo.IME_ACTION_SEARCH
             addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
@@ -439,10 +597,30 @@ class MainActivity : Activity() {
         }
         bubble = TextView(this).apply {
             textSize = 34f; setTextColor(fg); gravity = Gravity.CENTER; typeface = Typeface.DEFAULT_BOLD; alpha = 0f
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL; setColor(Color.argb(0x40, Color.red(fg), Color.green(fg), Color.blue(fg)))
-            }
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(alphaOf(fg, 0x40)) }
         }
+        loading = ProgressBar(this).apply {
+            indeterminateTintList = ColorStateList.valueOf(fg)
+            visibility = if (apps.isEmpty()) View.VISIBLE else View.GONE
+        }
+
+        val cardBg = if (Color.red(fg) > 128) 0xF2161618.toInt() else 0xF2F4F4F4.toInt()
+        folderTitle = TextView(this).apply {
+            setTextColor(fg); textSize = 18f; typeface = Typeface.DEFAULT_BOLD; setPadding(dp(6), 0, 0, dp(10))
+        }
+        folderBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        folderScroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false; addView(folderBox) }
+        folderCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(18), dp(16), dp(12)); isClickable = true
+            background = GradientDrawable().apply { cornerRadius = dp(28).toFloat(); setColor(cardBg) }
+            addView(folderTitle); addView(folderScroll, LinearLayout.LayoutParams(-1, -2))
+        }
+        folderLayer = FrameLayout(this).apply {
+            visibility = View.GONE; setBackgroundColor(0xB3000000.toInt()); isClickable = true
+            setOnClickListener { closeFolder() }
+            addView(folderCard, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER).apply { setMargins(dp(22), dp(22), dp(22), dp(22)) })
+        }
+
         val root = FrameLayout(this).apply {
             addView(LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
@@ -450,7 +628,10 @@ class MainActivity : Activity() {
             })
             addView(index, FrameLayout.LayoutParams(dp(26), -2, Gravity.END or Gravity.CENTER_VERTICAL))
             addView(bubble, FrameLayout.LayoutParams(dp(80), dp(80), Gravity.CENTER))
+            addView(loading, FrameLayout.LayoutParams(dp(44), dp(44), Gravity.CENTER))
+            addView(folderLayer, FrameLayout.LayoutParams(-1, -1))
         }
+        updateClock()
         if (apps.isNotEmpty()) refresh(anim())
         return root
     }
