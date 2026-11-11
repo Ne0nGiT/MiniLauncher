@@ -254,6 +254,7 @@ class SettingsActivity : Activity() {
 
         col.addView(section("ĐỒNG HỒ"))
         col.addView(sw("Hiện đồng hồ", "clock", true))
+        col.addView(chips("Khi chạm vào đồng hồ", "cclick", listOf("Phóng to (đồng hồ bàn)", "Mở app Đồng hồ máy"), 0))
         col.addView(sw("Hiện giờ", "ch", true))
         col.addView(sw("Hiện phút", "cm", true))
         col.addView(sw("Hiện giây", "cs", true))

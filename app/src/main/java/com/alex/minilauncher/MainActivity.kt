@@ -7,6 +7,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.LauncherApps
 import android.content.pm.ShortcutInfo
 import android.content.res.ColorStateList
@@ -27,6 +28,7 @@ import android.os.Process
 import android.provider.AlarmClock
 import android.provider.Settings
 import android.text.Editable
+import android.text.Layout
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.TextUtils
@@ -37,7 +39,9 @@ import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import android.util.TypedValue
 import android.view.ViewTreeObserver
+import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.OvershootInterpolator
 import android.view.inputmethod.EditorInfo
@@ -177,6 +181,9 @@ class MainActivity : Activity() {
     val iconCache = HashMap<String, Bitmap>()
     var dragMoved = false
     var dragHover = false
+    lateinit var deskLayer: FrameLayout
+    lateinit var deskTime: TextView
+    lateinit var deskDate: TextView
     lateinit var useTitle: TextView
     lateinit var useBox: LinearLayout
     lateinit var scroll: ScrollView
@@ -210,10 +217,12 @@ class MainActivity : Activity() {
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         if (::folderLayer.isInitialized) folderLayer.visibility = View.GONE
+        if (::deskLayer.isInitialized && deskLayer.visibility == View.VISIBLE) closeDesk()
         reset()
     }
     override fun onBackPressed() {
-        if (::folderLayer.isInitialized && folderLayer.visibility == View.VISIBLE) closeFolder() else reset()
+        if (::deskLayer.isInitialized && deskLayer.visibility == View.VISIBLE) closeDesk()
+        else if (::folderLayer.isInitialized && folderLayer.visibility == View.VISIBLE) closeFolder() else reset()
     }
 
     fun reset() {
@@ -333,7 +342,51 @@ class MainActivity : Activity() {
         clockTv.text = sb
         clockTv.visibility = if (sb.isEmpty()) View.GONE else View.VISIBLE
         val pats = arrayOf("EEEE, d MMMM", "EEE, d/M", "EEEE, d MMMM yyyy", "dd/MM/yyyy")
-        dateTv.text = fmt(pats[p.getInt("cdf", 0).coerceIn(0, 3)], now)
+        val ds = fmt(pats[p.getInt("cdf", 0).coerceIn(0, 3)], now)
+        dateTv.text = ds
+        if (::deskLayer.isInitialized && deskLayer.visibility == View.VISIBLE) { deskTime.text = sb; deskDate.text = ds }
+    }
+
+    // ---------- chạm vào đồng hồ ----------
+    fun onClockTap() { if (prefs().getInt("cclick", 0) == 0) openDesk() else openClockApp() }
+
+    fun openClockApp() {
+        val byLabel = apps.firstOrNull { val l = norm(it.label); l == "dong ho" || l == "clock" || l == "dong ho bao thuc" }
+        val pkgs = listOf("com.google.android.deskclock", "com.sec.android.app.clockpackage", "com.oplus.alarmclock",
+            "com.coloros.alarmclock", "com.android.deskclock", "com.huawei.deskclock", "com.vivo.alarmclock", "com.miui.clock")
+        val i = byLabel?.let { packageManager.getLaunchIntentForPackage(it.pkg) }
+            ?: pkgs.firstNotNullOfOrNull { packageManager.getLaunchIntentForPackage(it) }
+        try { startActivity(i ?: Intent(AlarmClock.ACTION_SHOW_ALARMS)) } catch (e: Exception) {}
+    }
+
+    fun fitDesk() {
+        val w = deskLayer.width - dp(32); val h = deskLayer.height
+        if (w <= 0 || h <= 0 || deskTime.text.isEmpty()) return
+        deskTime.setTextSize(TypedValue.COMPLEX_UNIT_PX, 100f)
+        val tw = Layout.getDesiredWidth(deskTime.text, deskTime.paint)
+        if (tw <= 0f) return
+        deskTime.setTextSize(TypedValue.COMPLEX_UNIT_PX, minOf(100f * w / tw, h * 0.55f))
+    }
+
+    fun openDesk() {
+        deskLayer.visibility = View.VISIBLE
+        updateClock()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+        deskLayer.post { fitDesk() }
+        if (anim()) {
+            deskLayer.alpha = 0f; deskLayer.scaleX = .85f; deskLayer.scaleY = .85f
+            deskLayer.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(260).setInterpolator(DecelerateInterpolator()).start()
+        } else deskLayer.alpha = 1f
+    }
+
+    fun closeDesk() {
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        setupWindow()
+        val end = { deskLayer.visibility = View.GONE; deskLayer.alpha = 1f; deskLayer.scaleX = 1f; deskLayer.scaleY = 1f }
+        if (anim()) deskLayer.animate().alpha(0f).scaleX(.9f).scaleY(.9f).setDuration(180).withEndAction { end() }.start() else end()
     }
 
     // ---------- hành động ----------
@@ -392,7 +445,7 @@ class MainActivity : Activity() {
         }
         if (prefs().getBoolean("folders", false)) add("Chuyển thư mục…") { chooseFolder(a) }
         add("Thông tin ứng dụng") { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${a.pkg}"))) }
-        add("Gỡ cài đặt") { startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${a.pkg}"))) }
+        add("Gỡ cài đặt") { uninstall(a) }
         AlertDialog.Builder(this).setTitle(a.label).setItems(acts.map { it.first }.toTypedArray()) { _, w -> acts[w].second() }.show()
     }
 
@@ -412,6 +465,24 @@ class MainActivity : Activity() {
 
     // ---------- quản lý thư mục ----------
     fun toastMsg(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
+
+    fun appDetails(pkg: String) =
+        startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$pkg")))
+
+    /** Gỡ app: cần quyền REQUEST_DELETE_PACKAGES (Android 9+). App hệ thống thì chỉ tắt được. */
+    fun uninstall(a: AppItem) {
+        try {
+            val f = packageManager.getApplicationInfo(a.pkg, 0).flags
+            if ((f and ApplicationInfo.FLAG_SYSTEM) != 0 && (f and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0) {
+                toastMsg("App hệ thống không gỡ hẳn được, bạn có thể tắt trong trang thông tin")
+                appDetails(a.pkg); return
+            }
+            startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${a.pkg}")))
+        } catch (e: Exception) {
+            toastMsg("Không mở được hộp thoại gỡ, chuyển sang trang thông tin app")
+            try { appDetails(a.pkg) } catch (e2: Exception) {}
+        }
+    }
 
     fun askName(title: String, initial: String, ok: (String) -> Unit) {
         val et = EditText(this).apply { setText(initial); setSingleLine(); setPadding(dp(24), dp(16), dp(24), dp(16)) }
@@ -476,7 +547,7 @@ class MainActivity : Activity() {
         fill(folderBox, items, cols, false, false, 0)
         val cellH = dp(prefs().getInt("icon", 56)) + dp(52)
         val rows = (items.size + cols - 1) / cols
-        folderScroll.layoutParams = LinearLayout.LayoutParams(-1, minOf(rows * cellH, (resources.displayMetrics.heightPixels * 0.55f).toInt()))
+        folderScroll.layoutParams = LinearLayout.LayoutParams(-1, minOf(rows * cellH, (resources.displayMetrics.heightPixels * 0.72f).toInt()))
         folderLayer.visibility = View.VISIBLE
         folderLayer.alpha = 0f; folderLayer.animate().alpha(1f).setDuration(180).start()
         folderCard.scaleX = .85f; folderCard.scaleY = .85f
@@ -677,6 +748,7 @@ class MainActivity : Activity() {
     // ---------- dựng giao diện ----------
     fun build(): View {
         fg = setupWindow()
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         dots.clear()
         val p = prefs()
         val soft = alphaOf(fg, 0x26)
@@ -705,8 +777,29 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(20), dp(8), dp(4))
             gravity = when (p.getInt("calign", 0)) { 1 -> Gravity.CENTER_HORIZONTAL; 2 -> Gravity.END; else -> Gravity.START }
             addView(clockTv); addView(dateTv)
-            setOnClickListener { try { startActivity(Intent(AlarmClock.ACTION_SHOW_ALARMS)) } catch (e: Exception) {} }
+            setOnClickListener { onClockTap() }
             pressAnim()
+        }
+        deskTime = TextView(this).apply {
+            includeFontPadding = false; maxLines = 1; gravity = Gravity.CENTER
+            typeface = Typeface.create(fonts[fi], Typeface.NORMAL); setTextColor(if (ccol == 0) Color.WHITE else ccol)
+        }
+        deskDate = TextView(this).apply {
+            gravity = Gravity.CENTER; textSize = 22f; setPadding(0, dp(12), 0, 0)
+            setTextColor(if (dcol == 0) 0xFFBBBBBB.toInt() else dcol)
+            typeface = if (fi == 4) Typeface.MONOSPACE else Typeface.DEFAULT
+            visibility = if (p.getBoolean("cdate", true)) View.VISIBLE else View.GONE
+        }
+        deskLayer = FrameLayout(this).apply {
+            visibility = View.GONE; setBackgroundColor(Color.BLACK); isClickable = true
+            setOnClickListener { closeDesk() }
+            addView(LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; setPadding(dp(16), dp(16), dp(16), dp(16))
+                addView(deskTime, LinearLayout.LayoutParams(-1, -2)); addView(deskDate, LinearLayout.LayoutParams(-1, -2))
+            }, FrameLayout.LayoutParams(-1, -1))
+            addOnLayoutChangeListener { _, l, t, r, b, ol, ot, orr, ob ->
+                if (r - l != orr - ol || b - t != ob - ot) post { fitDesk() }
+            }
         }
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setPadding(dp(14), 0, dp(26), dp(24))
@@ -802,6 +895,7 @@ class MainActivity : Activity() {
             addView(bubble, FrameLayout.LayoutParams(dp(80), dp(80), Gravity.CENTER))
             addView(loading, FrameLayout.LayoutParams(dp(44), dp(44), Gravity.CENTER))
             addView(folderLayer, FrameLayout.LayoutParams(-1, -1))
+            addView(deskLayer, FrameLayout.LayoutParams(-1, -1))
         }
         updateClock()
         if (apps.isNotEmpty()) refresh(anim())
